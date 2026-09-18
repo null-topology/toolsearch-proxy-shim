@@ -1,0 +1,6 @@
+*.jsonl
+captures/
+__pycache__/
+.venv/
+*.pyc
+.claude/
