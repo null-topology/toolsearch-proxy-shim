@@ -529,7 +529,7 @@ def _serve(port: int, handler) -> None:
     _QuietServer((BIND, port), handler).serve_forever()
 
 
-if __name__ == "__main__":
+def main() -> None:
     if CAPTURE:
         os.makedirs(os.path.join(CAPTURE, "in"), exist_ok=True)
         os.makedirs(os.path.join(CAPTURE, "out"), exist_ok=True)
@@ -540,3 +540,7 @@ if __name__ == "__main__":
         print(f"capturing to {CAPTURE}", flush=True)
     threading.Thread(target=_serve, args=(OUT_PORT, OutHandler), daemon=True).start()
     _serve(IN_PORT, InHandler)
+
+
+if __name__ == "__main__":
+    main()

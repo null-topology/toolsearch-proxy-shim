@@ -1,0 +1,26 @@
+[project]
+name = "toolsearch-proxy-shim"
+version = "0.2.0"
+description = "Keeps Claude Code's tool search working through a request-rewriting proxy, with per-request accounting"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/null-topology/toolsearch-proxy-shim"
+
+[project.scripts]
+toolsearch-proxy-shim = "shim:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+# A single-module project: the wheel carries shim.py at its root, nothing else.
+[tool.hatch.build.targets.wheel]
+only-include = ["shim.py"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["shim.py", "tests", "README.md", "LICENSE", "pyproject.toml"]

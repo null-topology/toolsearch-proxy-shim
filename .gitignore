@@ -2,5 +2,6 @@
 captures/
 __pycache__/
 .venv/
+dist/
 *.pyc
 .claude/

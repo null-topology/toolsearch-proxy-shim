@@ -96,9 +96,20 @@ only on the OUT side, so an OUT request count larger than the IN count is exactl
 
 No dependencies. One file, standard library only, Python 3.10+.
 
+Run a tagged release straight from GitHub with [uv](https://docs.astral.sh/uv/) (nothing to
+clone, nothing to publish; the configuration is all environment variables, see below):
+
+```sh
+uvx --from git+https://github.com/null-topology/toolsearch-proxy-shim@v0.2.0 toolsearch-proxy-shim
 ```
+
+or install it once as a tool (`uv tool install` the same `--from` spec) so that
+`toolsearch-proxy-shim` is on `PATH`. Or clone and run the file directly:
+
+```sh
 git clone https://github.com/null-topology/toolsearch-proxy-shim.git
 cd toolsearch-proxy-shim
+python shim.py
 ```
 
 ### Environment
