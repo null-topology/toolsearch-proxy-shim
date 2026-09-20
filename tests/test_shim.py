@@ -63,17 +63,19 @@ def tearDownModule():
         _stub_server.server_close()
 
 
-def post(port: int, path: str, body: bytes):
+def post(port: int, path: str, body: bytes, headers=None):
     """POST raw bytes and return (status, headers dict, body bytes)."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
     try:
-        conn.request("POST", path, body=body,
-                     headers={"content-type": "application/json",
-                              "content-length": str(len(body))})
+        request_headers = {"content-type": "application/json",
+                           "content-length": str(len(body))}
+        if headers:
+            request_headers.update(headers)
+        conn.request("POST", path, body=body, headers=request_headers)
         resp = conn.getresponse()
         data = resp.read()
-        headers = {k.lower(): v for k, v in resp.getheaders()}
-        return resp.status, headers, data
+        response_headers = {k.lower(): v for k, v in resp.getheaders()}
+        return resp.status, response_headers, data
     finally:
         conn.close()
 
@@ -119,7 +121,8 @@ class ShimCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def start_shim(self, mode="fix", capture_dir=None, log_path=None,
-                   replay_prompt=None, replay_marker=None, out_target=None, bind=None):
+                   replay_prompt=None, replay_marker=None, out_target=None, bind=None,
+                   auth_token=None):
         self.in_port = _free_port()
         self.out_port = _free_port()
         env = {k: v for k, v in os.environ.items()
@@ -141,6 +144,8 @@ class ShimCase(unittest.TestCase):
             env["SHIM_MODE"] = mode
         if bind is not None:
             env["SHIM_BIND"] = bind
+        if auth_token is not None:
+            env["SHIM_AUTH_TOKEN"] = auth_token
         if capture_dir is not None:
             env["CAPTURE_DIR"] = str(capture_dir)
         self._stdout = open(self.tmp / "shim.out", "w")
@@ -194,6 +199,47 @@ class ShimCase(unittest.TestCase):
                 return False
             time.sleep(0.05)
         return True
+
+
+class InboundAuth(ShimCase):
+    TOKEN = "test-shim-token"
+
+    def test_missing_token_is_rejected_before_upstream(self):
+        self.start_shim(auth_token=self.TOKEN)
+        self.assertIn("IN auth: on", (self.tmp / "shim.out").read_text())
+        status, headers, data = post(
+            self.in_port, "/v1/messages", json.dumps({"messages": []}).encode())
+        self.assertEqual(401, status)
+        self.assertEqual("application/json", headers.get("content-type"))
+        self.assertEqual(b'{"error": "unauthorized"}', data)
+        self.assertIsNone(stub_upstream.LAST["path"])
+        self.assertEqual(b"", stub_upstream.LAST["body"])
+
+    def test_wrong_token_is_rejected(self):
+        self.start_shim(auth_token=self.TOKEN)
+        status, _, _ = post(
+            self.in_port, "/v1/messages", json.dumps({"messages": []}).encode(),
+            headers={"X-Shim-Token": "wrong-token"})
+        self.assertEqual(401, status)
+        self.assertIsNone(stub_upstream.LAST["path"])
+
+    def test_correct_token_succeeds_and_is_not_forwarded(self):
+        self.start_shim(auth_token=self.TOKEN)
+        body = json.dumps({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
+        status, _, _ = post(
+            self.in_port, "/v1/messages", body,
+            headers={"X-Shim-Token": self.TOKEN})
+        self.assertEqual(200, status)
+        self.assertNotIn("x-shim-token", stub_upstream.LAST["headers"])
+
+    def test_rejected_request_is_logged(self):
+        self.start_shim(auth_token=self.TOKEN)
+        post(self.in_port, "/v1/messages", b"{}")
+        record = self.wait_for_log(lambda r: r.get("action") == "reject")[0]
+        self.assertEqual({"action": "reject", "side": "in", "status": 401},
+                         {key: record[key] for key in ("action", "side", "status")})
+        self.assertEqual(1, len([r for r in self.log_records() if r.get("action") == "reject"]))
 
 
 class RepairRules(ShimCase):

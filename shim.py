@@ -18,7 +18,7 @@ SHIM_MODE=log   record only: nothing is rewritten, but every tool_result that th
                 remembered is logged exactly as the gateway sent it (this is the diagnostic).
 
 Env:
-    SHIM_MODE, SHIM_IN_PORT, SHIM_OUT_PORT, IN_TARGET, OUT_TARGET,
+    SHIM_MODE, SHIM_IN_PORT, SHIM_OUT_PORT, IN_TARGET, OUT_TARGET, SHIM_AUTH_TOKEN,
     SHIM_LOG (jsonl), CAPTURE_DIR (optional: when unset or empty nothing is written to disk),
     REPLAY_PROMPT, REPLAY_MARKER (required, no default: how a gateway's own hidden request is
     recognised; pass an empty value to switch that half of the test off).
@@ -40,6 +40,7 @@ logged block is replaced too.
 from __future__ import annotations
 
 import gzip
+import hmac
 import http.client
 import json
 import zlib
@@ -66,7 +67,9 @@ CAPTURE = os.environ.get("CAPTURE_DIR") or ""
 # without a default, so the wording is always the operator's; an empty value disables that half.
 REPLAY_PROMPT = os.environ["REPLAY_PROMPT"]
 REPLAY_MARKER = os.environ["REPLAY_MARKER"]
+AUTH_TOKEN = os.environ.get("SHIM_AUTH_TOKEN", "")
 
+AUTH_HEADER = "X-Shim-Token"
 SECRET = {"authorization", "x-api-key", "cookie", "proxy-authorization"}
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
        "trailers", "transfer-encoding", "upgrade", "host", "content-length"}
@@ -294,11 +297,26 @@ class _Base(BaseHTTPRequestHandler):
 
     def _relay(self) -> None:
         n = _next(self.side)
+        if self.side == "in" and AUTH_TOKEN:
+            token = self.headers.get(AUTH_HEADER, "")
+            if not hmac.compare_digest(token, AUTH_TOKEN):
+                body = b'{"error": "unauthorized"}'
+                _log({"side": "in", "request": n, "action": "reject", "status": 401,
+                      "path": self.path})
+                self.close_connection = True
+                self.send_response(401)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
         # None when CAPTURE_DIR is unset: nothing at all is written to disk then.
         tag = os.path.join(CAPTURE, self.side, f"{n:03d}") if CAPTURE else None
         length = int(self.headers.get("content-length") or 0)
         body = self.rfile.read(length) if length else b""
         hdrs = list(self.headers.items())
+        if self.side == "in" and AUTH_TOKEN:
+            hdrs = [(k, v) for k, v in hdrs if k.lower() != AUTH_HEADER.lower()]
 
         try:
             body = self._transform(body, n)
@@ -475,7 +493,8 @@ if __name__ == "__main__":
         os.makedirs(os.path.join(CAPTURE, "in"), exist_ok=True)
         os.makedirs(os.path.join(CAPTURE, "out"), exist_ok=True)
     print(f"shim mode={MODE} IN {BIND}:{IN_PORT} -> {IN_TARGET} | "
-          f"OUT {BIND}:{OUT_PORT} -> {OUT_TARGET} | log={LOG_PATH}", flush=True)
+          f"OUT {BIND}:{OUT_PORT} -> {OUT_TARGET} | log={LOG_PATH} | "
+          f"IN auth: {'on' if AUTH_TOKEN else 'off'}", flush=True)
     if CAPTURE:
         print(f"capturing to {CAPTURE}", flush=True)
     threading.Thread(target=_serve, args=(OUT_PORT, OutHandler), daemon=True).start()

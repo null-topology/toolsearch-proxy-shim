@@ -107,6 +107,7 @@ cd toolsearch-proxy-shim
 | --- | --- | --- |
 | `SHIM_MODE` | `fix` | `fix` applies the two repair rules; `log` only records what the gateway sent, rewriting nothing (the diagnostic mode). |
 | `SHIM_BIND` | `127.0.0.1` | Address both listeners bind. Use `0.0.0.0` when the shim runs in a container and its ports are published. |
+| `SHIM_AUTH_TOKEN` | *(empty)* | When set, the IN listener rejects with 401 every request whose `X-Shim-Token` header does not equal it, and strips the header before forwarding. Leave empty for a loopback-only setup. |
 | `SHIM_IN_PORT` | required | Port of the IN listener, the one Claude Code talks to. |
 | `SHIM_OUT_PORT` | required | Port of the OUT listener, the one the gateway forwards to. |
 | `IN_TARGET` | required | Where IN forwards: the gateway URL that names OUT as the upstream. |
@@ -115,6 +116,10 @@ cd toolsearch-proxy-shim
 | `REPLAY_PROMPT` | required, no default | Opening words of the gateway's own hidden request, matched against the last user message. An empty value switches this signal off. |
 | `REPLAY_MARKER` | required, no default | A marker the gateway places inside that request. An empty value switches this signal off. |
 | `CAPTURE_DIR` | unset | When set, every request and response is also written under `<dir>/in` and `<dir>/out`. Unset or empty: nothing is written to disk — these files hold whole conversations. Usage accounting works either way. |
+
+### Protecting the IN listener
+
+Once the IN port is reachable beyond loopback, for example when it is published from a container or exposed through a tunnel, anyone who reaches it can spend the upstream credentials that sit behind the shim. A Claude Code client sends the header with `ANTHROPIC_CUSTOM_HEADERS="X-Shim-Token: <value>"` in its environment or settings `env` block. The shim removes the header before forwarding it upstream.
 
 Secrets are never written: `authorization`, `x-api-key`, `cookie` and `proxy-authorization` are
 stored as `<redacted>`, and token-shaped strings inside logged blocks are replaced too.
@@ -175,6 +180,7 @@ record kinds:
 | `action` | Written when |
 | --- | --- |
 | `remember` | IN saw a `tool_reference` for a `tool_use_id` for the first time. |
+| `reject` | IN rejected a request because its `X-Shim-Token` header did not match `SHIM_AUTH_TOKEN`. |
 | `strip` | OUT found extra blocks beside the reference; carries `removed` and `kept`. |
 | `restore` | OUT found the reference gone for a remembered id; carries `erased_content` and `restored`. |
 | `observe` | `log` mode only: a remembered `tool_result` exactly as the gateway sent it. |
