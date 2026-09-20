@@ -119,7 +119,7 @@ class ShimCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def start_shim(self, mode="fix", capture_dir=None, log_path=None,
-                   replay_prompt=None, replay_marker=None, out_target=None):
+                   replay_prompt=None, replay_marker=None, out_target=None, bind=None):
         self.in_port = _free_port()
         self.out_port = _free_port()
         env = {k: v for k, v in os.environ.items()
@@ -139,6 +139,8 @@ class ShimCase(unittest.TestCase):
         env["SHIM_LOG"] = str(log_path)
         if mode is not None:
             env["SHIM_MODE"] = mode
+        if bind is not None:
+            env["SHIM_BIND"] = bind
         if capture_dir is not None:
             env["CAPTURE_DIR"] = str(capture_dir)
         self._stdout = open(self.tmp / "shim.out", "w")
@@ -328,6 +330,18 @@ class UsageAccounting(ShimCase):
 
 
 class Plumbing(ShimCase):
+
+    def test_configured_bind_address_is_reported_and_serves_requests(self):
+        self.start_shim(bind="0.0.0.0")
+        banner = (self.tmp / "shim.out").read_text()
+        self.assertIn(f"IN 0.0.0.0:{self.in_port}", banner)
+        self.assertIn(f"OUT 0.0.0.0:{self.out_port}", banner)
+
+        body = json.dumps({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
+        status, _, data = post(self.in_port, "/v1/messages", body)
+        self.assertEqual(200, status)
+        self.assertEqual(stub_upstream.SSE.encode(), data)
 
     def test_in_to_out_chain_returns_the_body_unchanged(self):
         self.start_shim()

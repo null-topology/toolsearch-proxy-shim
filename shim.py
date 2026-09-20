@@ -1,6 +1,6 @@
 """Two-sided tool_reference shim around an API gateway.
 
-One process, two ThreadingHTTPServer listeners on 127.0.0.1:
+One process, two ThreadingHTTPServer listeners on 127.0.0.1 by default; set SHIM_BIND to change it:
 
     harness -> IN (SHIM_IN_PORT)  -> IN_TARGET  (the gateway route naming OUT as upstream)
     gateway -> OUT (SHIM_OUT_PORT) -> OUT_TARGET (https://api.anthropic.com/v1)
@@ -54,6 +54,7 @@ from urllib.parse import urlsplit
 MODE = os.environ.get("SHIM_MODE", "fix")
 IN_PORT = int(os.environ["SHIM_IN_PORT"])
 OUT_PORT = int(os.environ["SHIM_OUT_PORT"])
+BIND = os.environ.get("SHIM_BIND", "127.0.0.1")
 IN_TARGET = os.environ["IN_TARGET"]
 # Where OUT forwards. Defaults to the Anthropic API; override it for another compatible upstream.
 OUT_TARGET = os.environ.get("OUT_TARGET", "https://api.anthropic.com/v1")
@@ -466,15 +467,15 @@ class _QuietServer(ThreadingHTTPServer):
 
 
 def _serve(port: int, handler) -> None:
-    _QuietServer(("127.0.0.1", port), handler).serve_forever()
+    _QuietServer((BIND, port), handler).serve_forever()
 
 
 if __name__ == "__main__":
     if CAPTURE:
         os.makedirs(os.path.join(CAPTURE, "in"), exist_ok=True)
         os.makedirs(os.path.join(CAPTURE, "out"), exist_ok=True)
-    print(f"shim mode={MODE} IN 127.0.0.1:{IN_PORT} -> {IN_TARGET} | "
-          f"OUT 127.0.0.1:{OUT_PORT} -> {OUT_TARGET} | log={LOG_PATH}", flush=True)
+    print(f"shim mode={MODE} IN {BIND}:{IN_PORT} -> {IN_TARGET} | "
+          f"OUT {BIND}:{OUT_PORT} -> {OUT_TARGET} | log={LOG_PATH}", flush=True)
     if CAPTURE:
         print(f"capturing to {CAPTURE}", flush=True)
     threading.Thread(target=_serve, args=(OUT_PORT, OutHandler), daemon=True).start()

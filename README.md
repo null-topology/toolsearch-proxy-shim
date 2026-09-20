@@ -42,7 +42,7 @@ sends a `tool_reference` at all.
 
 ## What the shim does
 
-One process, two HTTP listeners on `127.0.0.1`. The gateway is wrapped on both sides:
+One process, two HTTP listeners on `127.0.0.1` by default; set `SHIM_BIND` to change it. The gateway is wrapped on both sides:
 
 ```
 Claude Code → IN (shim) → gateway → OUT (shim) → api.anthropic.com
@@ -106,6 +106,7 @@ cd toolsearch-proxy-shim
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SHIM_MODE` | `fix` | `fix` applies the two repair rules; `log` only records what the gateway sent, rewriting nothing (the diagnostic mode). |
+| `SHIM_BIND` | `127.0.0.1` | Address both listeners bind. Use `0.0.0.0` when the shim runs in a container and its ports are published. |
 | `SHIM_IN_PORT` | required | Port of the IN listener, the one Claude Code talks to. |
 | `SHIM_OUT_PORT` | required | Port of the OUT listener, the one the gateway forwards to. |
 | `IN_TARGET` | required | Where IN forwards: the gateway URL that names OUT as the upstream. |
