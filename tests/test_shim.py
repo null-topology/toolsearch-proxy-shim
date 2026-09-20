@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -373,6 +374,66 @@ class UsageAccounting(ShimCase):
         self.assertIsNone(record["usage"])
         self.assertEqual(404, record["status"])
         self.assertIsNone(self.proc.poll())  # still alive
+
+
+class RelayOutcomes(ShimCase):
+    """Every relay leaves a record: how it ended and how long it took. The events a client
+    reports as "retrying" (a dead upstream, a truncated stream) must be in the log, not only
+    on stdout."""
+
+    def test_in_side_logs_a_relay_record_with_duration(self):
+        self.start_shim()
+        body = json.dumps({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
+        self.assertEqual(200, post(self.in_port, "/v1/messages", body)[0])
+        record = self.wait_for_log(lambda r: r.get("action") == "relay")[0]
+        self.assertEqual({"side": "in", "status": 200, "path": "/v1/messages",
+                          "bytes": len(stub_upstream.SSE.encode())},
+                         {k: record[k] for k in ("side", "status", "path", "bytes")})
+        self.assertIsInstance(record["duration_ms"], int)
+        self.assertGreaterEqual(record["duration_ms"], 0)
+        usage = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
+        self.assertIsInstance(usage["duration_ms"], int)
+
+    def test_unreachable_upstream_logs_a_transport_record(self):
+        self.start_shim(out_target=f"http://127.0.0.1:{_free_port()}/v1")
+        status, _, _ = post(self.out_port, "/v1/messages", json.dumps({"messages": []}).encode())
+        self.assertEqual(502, status)
+        record = self.wait_for_log(lambda r: r.get("action") == "transport")[0]
+        self.assertEqual({"side": "out", "phase": "connect", "status": 502, "bytes": 0},
+                         {k: record[k] for k in ("side", "phase", "status", "bytes")})
+        self.assertIn("ConnectionRefusedError", record["error"])
+
+    def test_upstream_dying_mid_stream_logs_a_transport_record(self):
+        self.start_shim()
+        # The shim has already sent 200 when the upstream vanishes, so the client sees a
+        # truncated chunked body: exactly what a CLI then reports as a retry. (http.client
+        # raises before handing over the chunk it had buffered, hence 0 bytes relayed.)
+        with self.assertRaises(http.client.IncompleteRead):
+            post(self.out_port, "/v1/truncate", b"{}")
+        record = self.wait_for_log(lambda r: r.get("action") == "transport")[0]
+        self.assertEqual({"side": "out", "phase": "stream", "status": 200, "bytes": 0},
+                         {k: record[k] for k in ("side", "phase", "status", "bytes")})
+        self.assertIn("IncompleteRead", record["error"])
+        self.assertIsNone(self.proc.poll())  # still alive
+
+    def test_client_leaving_mid_stream_logs_client_gone(self):
+        self.start_shim()
+        request = (b"POST /v1/slow HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n"
+                   b"content-type: application/json\r\n\r\n{}")
+        sock = socket.create_connection(("127.0.0.1", self.in_port), timeout=10)
+        # linger 0: close() sends RST at once, so the shim's next write fails instead of
+        # filling a kernel buffer nobody reads (a plain close is not prompt on every OS)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.sendall(request)
+        sock.recv(4096)  # the status line and headers, maybe the first chunk
+        sock.close()
+        record = self.wait_for_log(lambda r: r.get("action") == "client-gone"
+                                   and r.get("side") == "in")[0]
+        self.assertEqual({"status": 200, "path": "/v1/slow"},
+                         {k: record[k] for k in ("status", "path")})
+        self.assertIn("Error", record["error"])
+        self.assertIsNone(self.proc.poll())
 
 
 class Plumbing(ShimCase):

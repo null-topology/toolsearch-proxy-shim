@@ -2,13 +2,17 @@
 
 POST /v1/messages              -> SSE stream with message_start usage and message_delta output
 POST /v1/messages/count_tokens -> gzip-encoded JSON {"usage": {"input_tokens": N}}
+POST /v1/truncate              -> a chunked 200 that dies after its first chunk (EOF mid-body)
+POST /v1/slow                  -> a chunked 200 streamed in eight pieces over about a second
 Any other path                 -> 404 JSON without usage.
 
 Every request is recorded in LAST so a test can assert on what actually arrived here.
 """
 import gzip
 import json
+import socket
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 SSE = (
@@ -60,6 +64,31 @@ class H(BaseHTTPRequestHandler):
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if self.path.endswith("/truncate"):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            self.wfile.write(b"5\r\nhello\r\n")
+            self.wfile.flush()
+            # FIN instead of the terminating chunk: the peer's chunked reader hits EOF
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_WR)
+            return
+        if self.path.endswith("/slow"):
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+            try:
+                for _ in range(8):
+                    self.wfile.write(b"5\r\nhello\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.15)
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                pass  # the shim hung up because its own client left; that is the test
             return
         body = json.dumps({"type": "error", "error": {"message": "nope"}}).encode()
         self.send_response(404)

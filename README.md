@@ -166,13 +166,14 @@ CLI and may change or disappear without notice.
 Each relayed request prints one line on stdout:
 
 ```
-[out 003] POST /v1/messages -> 200 origin=harness in=491 cache_w=624 cache_r=389040 out=712 | total[harness] n=3 in=1473 cache_w=1872 cache_r=1167120 out=2136
+[out 003] POST /v1/messages -> 200 8412ms origin=harness in=491 cache_w=624 cache_r=389040 out=712 | total[harness] n=3 in=1473 cache_w=1872 cache_r=1167120 out=2136
 ```
 
-`[in NNN]` / `[out NNN]` is the side and its request counter; `in / cache_w / cache_r / out` are
-`input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens` for
-that response, then the running total for that origin. IN lines carry no usage — only OUT sees
-responses from the API.
+`[in NNN]` / `[out NNN]` is the side and its request counter, then the status and the time from
+the first byte of the request to the last byte of the response; `in / cache_w / cache_r / out`
+are `input_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`
+for that response, then the running total for that origin. IN lines carry no usage — only OUT
+sees responses from the API.
 
 The jsonl file holds one record per line, each with `ts`, `mode`, `side` and `request`. The
 record kinds:
@@ -184,9 +185,16 @@ record kinds:
 | `strip` | OUT found extra blocks beside the reference; carries `removed` and `kept`. |
 | `restore` | OUT found the reference gone for a remembered id; carries `erased_content` and `restored`. |
 | `observe` | `log` mode only: a remembered `tool_result` exactly as the gateway sent it. |
-| `usage` | One OUT response accounted for; carries `origin`, `status`, `usage` and `totals`. `usage` is `null` when the reply carried none (errors, unknown shapes). |
+| `relay` | One IN response delivered in full; carries `status`, `path`, `bytes` and `duration_ms`. |
+| `usage` | One OUT response accounted for; carries `origin`, `status`, `duration_ms`, `usage` and `totals`. `usage` is `null` when the reply carried none (errors, unknown shapes). |
 | `usage-error` | The response body could not be parsed for usage. |
 | `transform-error` | Inspecting or repairing a request body raised; the body was forwarded unchanged. |
+| `transport` | The connection to the next hop failed: `phase: "connect"` before any response (the client got a 502), or `phase: "stream"` mid-body (the client got a truncated stream). Carries `error`, `bytes` already relayed and `duration_ms`. |
+| `client-gone` | The client closed its connection while the response was still streaming; carries `status`, `bytes`, `error`, `duration_ms`. |
+
+A client that reports "retrying" or "waiting for the API" has usually hit one of the last two.
+When neither appears for that moment, the break was between the client and the IN port, not
+behind the shim.
 
 The running totals, per origin:
 

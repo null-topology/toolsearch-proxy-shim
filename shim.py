@@ -105,6 +105,10 @@ def _scrub(obj):
     return obj
 
 
+def _ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
 def _log(record: dict) -> None:
     record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     record["mode"] = MODE
@@ -295,8 +299,25 @@ class _Base(BaseHTTPRequestHandler):
     def _transform(self, body: bytes, n: int) -> bytes:
         raise NotImplementedError
 
+    def _broken(self, action: str, n: int, status: int, sent: int, started: float,
+                exc: BaseException, phase: str | None = None) -> None:
+        """A relay that did not end normally: the upstream connection failed (`transport`,
+        phase `connect` before any response or `stream` mid-body) or the client went away
+        while the body was streaming (`client-gone`). Always in the log, never only on stdout:
+        these are the events a client reports as a retry, and the terminal is not always there."""
+        err = f"{type(exc).__name__}: {exc}"
+        record = {"side": self.side, "request": n, "action": action, "path": self.path,
+                  "status": status, "bytes": sent, "error": err, "duration_ms": _ms(started)}
+        if phase:
+            record["phase"] = phase
+        _log(record)
+        print(f"[{self.side} {n:03d}] {self.command} {self.path} -> {action}"
+              f"{' (' + phase + ')' if phase else ''} after {sent} bytes: {err}", flush=True)
+        self.close_connection = True
+
     def _relay(self) -> None:
         n = _next(self.side)
+        started = time.monotonic()
         if self.side == "in" and AUTH_TOKEN:
             token = self.headers.get(AUTH_HEADER, "")
             if not hmac.compare_digest(token, AUTH_TOKEN):
@@ -363,11 +384,10 @@ class _Base(BaseHTTPRequestHandler):
                 with open(tag + "-resp.json", "w") as fh:
                     json.dump({"status": 599, "error": f"{type(exc).__name__}: {exc}"},
                               fh, indent=2)
+            self._broken("transport", n, 502, 0, started, exc, phase="connect")
             self.send_response(502)
             self.send_header("content-length", "0")
             self.end_headers()
-            print(f"[{self.side} {n:03d}] {self.command} {self.path} -> "
-                  f"transport {type(exc).__name__}: {exc}", flush=True)
             return
 
         rh = resp.getheaders()
@@ -385,9 +405,16 @@ class _Base(BaseHTTPRequestHandler):
 
         out = open(tag + "-resp.body", "wb") if tag else None
         buf = bytearray()
+        sent = 0
         try:
             while True:
-                chunk = resp.read(4096)
+                try:
+                    chunk = resp.read(4096)
+                except Exception as exc:  # noqa: BLE001
+                    # the upstream died mid-body; the client is left with a truncated chunked
+                    # stream (no terminating chunk), which is what it then reports as a retry
+                    self._broken("transport", n, resp.status, sent, started, exc, phase="stream")
+                    return
                 if not chunk:
                     break
                 if out is not None:
@@ -395,35 +422,49 @@ class _Base(BaseHTTPRequestHandler):
                     out.flush()
                 if len(buf) < RESP_BUFFER_CAP:
                     buf.extend(chunk)
-                self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                try:
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                    self.wfile.flush()
+                except OSError as exc:
+                    self._broken("client-gone", n, resp.status, sent, started, exc)
+                    return
+                sent += len(chunk)
+            try:
+                self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            except OSError as exc:
+                self._broken("client-gone", n, resp.status, sent, started, exc)
+                return
         finally:
             if out is not None:
                 out.close()
             conn.close()
 
-        line = f"[{self.side} {n:03d}] {self.command} {self.path} -> {resp.status}"
+        ms = _ms(started)
+        line = f"[{self.side} {n:03d}] {self.command} {self.path} -> {resp.status} {ms}ms"
         if self.side == "out":
-            line += self._account_usage(bytes(buf), rh, n, resp.status)
+            line += self._account_usage(bytes(buf), rh, n, resp.status, ms)
+        else:
+            _log({"side": "in", "request": n, "action": "relay", "status": resp.status,
+                  "path": self.path, "bytes": sent, "duration_ms": ms})
         print(line, flush=True)
 
-    def _account_usage(self, raw: bytes, headers, n: int, status: int) -> str:
+    def _account_usage(self, raw: bytes, headers, n: int, status: int, ms: int) -> str:
         origin = getattr(self, "origin", "unknown")
         try:
             usage = _usage_from_response(raw, headers)
         except Exception as exc:  # noqa: BLE001
             _log({"side": "out", "request": n, "action": "usage-error", "origin": origin,
-                  "status": status, "error": f"{type(exc).__name__}: {exc}"})
+                  "status": status, "duration_ms": ms, "error": f"{type(exc).__name__}: {exc}"})
             return f" origin={origin} usage=unreadable"
         if usage is None:
             _log({"side": "out", "request": n, "action": "usage", "origin": origin,
-                  "status": status, "usage": None})
+                  "status": status, "path": self.path, "duration_ms": ms, "usage": None})
             return f" origin={origin} usage=none"
         totals = _account(origin, usage)
         _log({"side": "out", "request": n, "action": "usage", "origin": origin,
-              "status": status, "path": self.path, "usage": usage, "totals": totals})
+              "status": status, "path": self.path, "duration_ms": ms, "usage": usage,
+              "totals": totals})
         mine = totals[origin]
         return (f" origin={origin} {_usage_line(usage)} | total[{origin}] "
                 f"n={mine['requests']} {_usage_line(mine)}")
