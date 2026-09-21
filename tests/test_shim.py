@@ -2,12 +2,13 @@
 
 A stub upstream runs in a thread in this process; the shim runs as a real subprocess with its
 own environment, so the tests exercise the same code path a deployment does: a client speaks
-HTTP to the IN or OUT port, the shim forwards, the stub records what actually arrived.
+HTTP to the shim's port, the shim forwards, the stub records what actually arrived.
 
 Run from the repository root:
 
     python -m unittest discover -s tests
 """
+import gzip
 import http.client
 import json
 import os
@@ -27,19 +28,21 @@ import stub_upstream  # noqa: E402
 
 SHIM = Path(__file__).resolve().parent.parent / "shim.py"
 
-# The shim requires both, without a default. These are arbitrary fixtures: the whole point of the
-# variables is that the wording is configuration, so any string does.
-REPLAY_PROMPT = "TEST-REPLAY-OPENING"
-REPLAY_MARKER = "TEST-REPLAY-MARKER"
-# Whatever a gateway may add beside a tool_reference. The shim keys on the reference, never on
-# the shape of what stands next to it.
-ANNOTATION = "[annotation added by the gateway]"
-# start_shim(out_target=UNSET) leaves OUT_TARGET out of the environment entirely, so the shim
+# The shim requires a pattern, without a default. This one is an arbitrary fixture: the whole
+# point of the variable is that the shape of the annotation is configuration.
+PATTERN = r"\[note [0-9]+\]"
+REFERENCE = {"type": "tool_reference", "tool_name": "Widget"}
+# start_shim(target=UNSET) leaves SHIM_TARGET out of the environment entirely, so the shim
 # falls back to its own default instead of the stub.
 UNSET = object()
 
 _stub_server = None
 _stub_port = 0
+
+
+def annotation(number: int) -> dict:
+    """What a gateway may put beside a tool_reference, in the shape PATTERN describes."""
+    return {"type": "text", "text": f"[note {number}]"}
 
 
 def _free_port() -> int:
@@ -92,6 +95,11 @@ def tool_result_request(tool_use_id: str, content) -> bytes:
     }).encode()
 
 
+def text_request() -> bytes:
+    return json.dumps({"model": "m", "messages": [
+        {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
+
+
 def sent_tool_result_content(raw: bytes):
     """The tool_result content as it arrived at the stub."""
     payload = json.loads(raw)
@@ -121,54 +129,40 @@ class ShimCase(unittest.TestCase):
             self._stdout.close()
         self._tmp.cleanup()
 
-    def start_shim(self, mode="fix", capture_dir=None, log_path=None,
-                   replay_prompt=None, replay_marker=None, out_target=None, bind=None,
-                   auth_token=None):
-        self.in_port = _free_port()
-        self.out_port = _free_port()
+    def start_shim(self, mode="fix", capture_dir=None, target=None, bind=None):
+        self.port = _free_port()
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("SHIM_") and k not in ("CAPTURE_DIR", "IN_TARGET",
-                                                          "OUT_TARGET", "REPLAY_PROMPT",
-                                                          "REPLAY_MARKER")}
-        env["SHIM_IN_PORT"] = str(self.in_port)
-        env["SHIM_OUT_PORT"] = str(self.out_port)
-        env["REPLAY_PROMPT"] = REPLAY_PROMPT if replay_prompt is None else replay_prompt
-        env["REPLAY_MARKER"] = REPLAY_MARKER if replay_marker is None else replay_marker
-        # No gateway in the tests: IN forwards straight to OUT, which forwards to the stub.
-        env["IN_TARGET"] = f"http://127.0.0.1:{self.out_port}/v1"
-        if out_target is not UNSET:
-            env["OUT_TARGET"] = out_target or f"http://127.0.0.1:{_stub_port}/v1"
-        if log_path is None:
-            log_path = self.log
-        env["SHIM_LOG"] = str(log_path)
+               if not k.startswith("SHIM_") and k != "CAPTURE_DIR"}
+        env["SHIM_PORT"] = str(self.port)
+        env["SHIM_STRIP_PATTERN"] = PATTERN
+        if target is not UNSET:
+            env["SHIM_TARGET"] = target or f"http://127.0.0.1:{_stub_port}/v1"
+        env["SHIM_LOG"] = str(self.log)
         if mode is not None:
             env["SHIM_MODE"] = mode
         if bind is not None:
             env["SHIM_BIND"] = bind
-        if auth_token is not None:
-            env["SHIM_AUTH_TOKEN"] = auth_token
         if capture_dir is not None:
             env["CAPTURE_DIR"] = str(capture_dir)
         self._stdout = open(self.tmp / "shim.out", "w")
         self.proc = subprocess.Popen([sys.executable, str(SHIM)], cwd=str(self.tmp),
                                      env=env, stdout=self._stdout,
                                      stderr=subprocess.STDOUT)
-        self._wait_ports()
+        self._wait_port()
 
-    def _wait_ports(self, timeout=20.0):
+    def _wait_port(self, timeout=20.0):
         deadline = time.time() + timeout
-        for port in (self.in_port, self.out_port):
-            while True:
-                if self.proc.poll() is not None:
-                    raise AssertionError(
-                        "shim exited early:\n" + (self.tmp / "shim.out").read_text())
-                try:
-                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
-                    break
-                except OSError:
-                    if time.time() > deadline:
-                        raise AssertionError(f"shim port {port} never opened")
-                    time.sleep(0.05)
+        while True:
+            if self.proc.poll() is not None:
+                raise AssertionError(
+                    "shim exited early:\n" + (self.tmp / "shim.out").read_text())
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=1).close()
+                return
+            except OSError:
+                if time.time() > deadline:
+                    raise AssertionError(f"shim port {self.port} never opened")
+                time.sleep(0.05)
 
     def log_records(self):
         if not self.log.exists():
@@ -179,6 +173,9 @@ class ShimCase(unittest.TestCase):
             if line:
                 out.append(json.loads(line))
         return out
+
+    def records(self, action):
+        return [r for r in self.log_records() if r.get("action") == action]
 
     def wait_for_log(self, predicate, timeout=10.0):
         """Log writes for a response happen after the client already has the body; poll."""
@@ -202,178 +199,86 @@ class ShimCase(unittest.TestCase):
         return True
 
 
-class InboundAuth(ShimCase):
-    TOKEN = "test-shim-token"
+class StripRule(ShimCase):
+    # Request records (strip, unmatched) are written before the request is forwarded, so they
+    # are complete by the time the client has its response.
 
-    def test_missing_token_is_rejected_before_upstream(self):
-        self.start_shim(auth_token=self.TOKEN)
-        self.assertIn("IN auth: on", (self.tmp / "shim.out").read_text())
-        status, headers, data = post(
-            self.in_port, "/v1/messages", json.dumps({"messages": []}).encode())
-        self.assertEqual(401, status)
-        self.assertEqual("application/json", headers.get("content-type"))
-        self.assertEqual(b'{"error": "unauthorized"}', data)
-        self.assertIsNone(stub_upstream.LAST["path"])
-        self.assertEqual(b"", stub_upstream.LAST["body"])
-
-    def test_wrong_token_is_rejected(self):
-        self.start_shim(auth_token=self.TOKEN)
-        status, _, _ = post(
-            self.in_port, "/v1/messages", json.dumps({"messages": []}).encode(),
-            headers={"X-Shim-Token": "wrong-token"})
-        self.assertEqual(401, status)
-        self.assertIsNone(stub_upstream.LAST["path"])
-
-    def test_correct_token_succeeds_and_is_not_forwarded(self):
-        self.start_shim(auth_token=self.TOKEN)
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        status, _, _ = post(
-            self.in_port, "/v1/messages", body,
-            headers={"X-Shim-Token": self.TOKEN})
-        self.assertEqual(200, status)
-        self.assertNotIn("x-shim-token", stub_upstream.LAST["headers"])
-
-    def test_rejected_request_is_logged(self):
-        self.start_shim(auth_token=self.TOKEN)
-        post(self.in_port, "/v1/messages", b"{}")
-        record = self.wait_for_log(lambda r: r.get("action") == "reject")[0]
-        self.assertEqual({"action": "reject", "side": "in", "status": 401},
-                         {key: record[key] for key in ("action", "side", "status")})
-        self.assertEqual(1, len([r for r in self.log_records() if r.get("action") == "reject"]))
-
-
-class RepairRules(ShimCase):
-
-    def test_strip_keeps_only_the_reference_block(self):
+    def test_annotation_beside_a_reference_is_removed(self):
         self.start_shim()
-        body = tool_result_request("toolu_strip", [
-            {"type": "tool_reference", "tool_name": "Widget"},
-            {"type": "text", "text": ANNOTATION},
-        ])
-        status, _, _ = post(self.out_port, "/v1/messages", body)
+        body = tool_result_request("toolu_strip", [REFERENCE, annotation(7)])
+        status, _, _ = post(self.port, "/v1/messages", body)
         self.assertEqual(200, status)
-        self.assertEqual(
-            [{"type": "tool_reference", "tool_name": "Widget"}],
-            sent_tool_result_content(stub_upstream.LAST["body"]))
-        record = self.wait_for_log(lambda r: r.get("action") == "strip")[0]
+        self.assertEqual([REFERENCE], sent_tool_result_content(stub_upstream.LAST["body"]))
+        record = self.records("strip")[0]
         self.assertEqual("toolu_strip", record["tool_use_id"])
-        self.assertEqual([{"type": "text", "text": ANNOTATION}], record["removed"])
+        self.assertEqual([annotation(7)], record["removed"])
+        self.assertEqual([REFERENCE], record["kept"])
+        self.assertEqual([], self.records("unmatched"))
 
-    def test_restore_puts_the_remembered_reference_back(self):
+    def test_rewritten_body_does_not_depend_on_the_annotation(self):
+        # A gateway may renumber its annotations from one turn to the next. What reaches the
+        # API must not change with them, or every turn would miss the prompt cache.
         self.start_shim()
-        reference = {"type": "tool_reference", "tool_name": "Widget"}
-        # IN sees the harness's own request and remembers the reference for this id.
-        status, _, _ = post(self.in_port, "/v1/messages",
-                            tool_result_request("toolu_restore", [reference]))
-        self.assertEqual(200, status)
-        self.assertEqual([reference], sent_tool_result_content(stub_upstream.LAST["body"]))
-        self.wait_for_log(lambda r: r.get("action") == "remember")
+        post(self.port, "/v1/messages",
+             tool_result_request("toolu_same", [REFERENCE, annotation(7)]))
+        first = stub_upstream.LAST["body"]
+        post(self.port, "/v1/messages",
+             tool_result_request("toolu_same", [REFERENCE, annotation(12)]))
+        self.assertEqual(first, stub_upstream.LAST["body"])
 
-        # Now the same id comes back on the OUT side with the reference erased.
-        stub_upstream.reset()
-        status, _, _ = post(self.out_port, "/v1/messages", tool_result_request(
-            "toolu_restore", [{"type": "text", "text": ANNOTATION}]))
-        self.assertEqual(200, status)
-        self.assertEqual([reference], sent_tool_result_content(stub_upstream.LAST["body"]))
-        record = self.wait_for_log(lambda r: r.get("action") == "restore")[0]
-        self.assertEqual("toolu_restore", record["tool_use_id"])
-        self.assertEqual([reference], record["restored"])
-
-    def test_unknown_tool_result_passes_byte_for_byte(self):
+    def test_rewritten_body_carries_what_an_unannotated_one_does(self):
+        # Once the gateway stops annotating, requests pass byte for byte. They must carry the
+        # content the API has been seeing all along, so the cache survives that change too.
         self.start_shim()
-        body = tool_result_request("toolu_unknown", "plain text result")
-        status, _, _ = post(self.out_port, "/v1/messages", body)
+        post(self.port, "/v1/messages",
+             tool_result_request("toolu_same", [REFERENCE, annotation(7)]))
+        rewritten = json.loads(stub_upstream.LAST["body"])
+        clean = tool_result_request("toolu_same", [REFERENCE])
+        post(self.port, "/v1/messages", clean)
+        self.assertEqual(clean, stub_upstream.LAST["body"])
+        self.assertEqual(json.loads(clean), rewritten)
+
+    def test_unrecognised_block_is_kept_and_logged(self):
+        self.start_shim()
+        other = {"type": "text", "text": "something the pattern does not describe"}
+        body = tool_result_request("toolu_mixed", [REFERENCE, annotation(7), other])
+        status, _, _ = post(self.port, "/v1/messages", body)
         self.assertEqual(200, status)
+        self.assertEqual([REFERENCE, other],
+                         sent_tool_result_content(stub_upstream.LAST["body"]))
+        self.assertEqual([annotation(7)], self.records("strip")[0]["removed"])
+        record = self.records("unmatched")[0]
+        self.assertEqual("toolu_mixed", record["tool_use_id"])
+        self.assertEqual([other], record["blocks"])
+
+    def test_pattern_must_match_the_whole_text(self):
+        self.start_shim()
+        partial = {"type": "text", "text": "[note 7] followed by real content"}
+        body = tool_result_request("toolu_partial", [REFERENCE, partial])
+        post(self.port, "/v1/messages", body)
         self.assertEqual(body, stub_upstream.LAST["body"])
-        self.assertEqual([], [r for r in self.log_records()
-                              if r.get("action") in ("strip", "restore")])
+        self.assertEqual([], self.records("strip"))
+        self.assertEqual([partial], self.records("unmatched")[0]["blocks"])
 
-
-class UsageAccounting(ShimCase):
-
-    def test_usage_from_an_sse_reply(self):
+    def test_block_with_any_other_key_is_kept(self):
+        # A cache breakpoint on such a block must never be dropped silently.
         self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        status, _, _ = post(self.out_port, "/v1/messages", body)
-        self.assertEqual(200, status)
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertEqual("harness", record["origin"])
-        self.assertEqual({"input_tokens": 491,
-                          "cache_creation_input_tokens": 624,
-                          "cache_read_input_tokens": 389040,
-                          "output_tokens": 712}, record["usage"])
-        self.assertEqual(1, record["totals"]["harness"]["requests"])
+        marked = dict(annotation(7), cache_control={"type": "ephemeral"})
+        body = tool_result_request("toolu_marked", [REFERENCE, marked])
+        post(self.port, "/v1/messages", body)
+        self.assertEqual(body, stub_upstream.LAST["body"])
+        self.assertEqual([], self.records("strip"))
+        self.assertEqual([marked], self.records("unmatched")[0]["blocks"])
 
-    def test_origin_gateway_replay_by_prompt(self):
+    def test_tool_result_without_a_reference_passes_byte_for_byte(self):
+        # Annotations elsewhere are the gateway's own business, even in the matching shape.
         self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "x"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "y"}]},
-            {"role": "user", "content": [{"type": "text", "text":
-                f"{REPLAY_PROMPT} followed by whatever else the gateway asks for"}]},
-        ]}).encode()
-        status, _, _ = post(self.out_port, "/v1/messages", body)
-        self.assertEqual(200, status)
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertEqual("gateway-replay", record["origin"])
-
-    def test_origin_gateway_replay_by_marker_alone(self):
-        # A gateway may word the request in a way REPLAY_PROMPT does not cover; the marker on
-        # its own is enough to catch it. Either signal suffices.
-        self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "x"}]},
-            {"role": "assistant", "content": [{"type": "text", "text": "y"}]},
-            {"role": "user", "content": [{"type": "text", "text":
-                "An opening this shim was never told about.\n\n"
-                f"{REPLAY_MARKER} further down the same message"}]},
-        ]}).encode()
-        status, _, _ = post(self.out_port, "/v1/messages", body)
-        self.assertEqual(200, status)
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertEqual("gateway-replay", record["origin"])
-
-    def test_empty_replay_variables_switch_the_detection_off(self):
-        # Without the emptiness guard, "".startswith and "" in text match every request and
-        # everything would be misfiled as a replay.
-        self.start_shim(replay_prompt="", replay_marker="")
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text":
-                f"{REPLAY_PROMPT} anything at all {REPLAY_MARKER}"}]},
-        ]}).encode()
-        status, _, _ = post(self.out_port, "/v1/messages", body)
-        self.assertEqual(200, status)
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertEqual("harness", record["origin"])
-
-    def test_out_target_defaults_to_the_anthropic_api(self):
-        # Nothing leaves the machine here: the banner is printed before either listener starts,
-        # and this test sends no request.
-        self.start_shim(out_target=UNSET)
-        banner = (self.tmp / "shim.out").read_text()
-        self.assertIn(f"OUT 127.0.0.1:{self.out_port} -> https://api.anthropic.com/v1", banner)
-
-    def test_origin_count_tokens(self):
-        self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": "hello"}]}).encode()
-        status, headers, _ = post(self.out_port, "/v1/messages/count_tokens", body)
-        self.assertEqual(200, status)
-        self.assertEqual("gzip", headers.get("content-encoding"))
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertEqual("count_tokens", record["origin"])
-        self.assertEqual(12345, record["usage"]["input_tokens"])
-
-    def test_reply_without_usage_logs_null(self):
-        self.start_shim()
-        status, _, _ = post(self.out_port, "/v1/nothing", json.dumps({"messages": []}).encode())
-        self.assertEqual(404, status)
-        record = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertIsNone(record["usage"])
-        self.assertEqual(404, record["status"])
-        self.assertIsNone(self.proc.poll())  # still alive
+        for tid, content in (("toolu_text", "plain text result"),
+                             ("toolu_list", [annotation(7)])):
+            body = tool_result_request(tid, content)
+            self.assertEqual(200, post(self.port, "/v1/messages", body)[0])
+            self.assertEqual(body, stub_upstream.LAST["body"])
+        self.assertEqual([], self.records("strip") + self.records("unmatched"))
 
 
 class RelayOutcomes(ShimCase):
@@ -381,27 +286,23 @@ class RelayOutcomes(ShimCase):
     reports as "retrying" (a dead upstream, a truncated stream) must be in the log, not only
     on stdout."""
 
-    def test_in_side_logs_a_relay_record_with_duration(self):
+    def test_relay_record_with_duration(self):
         self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        self.assertEqual(200, post(self.in_port, "/v1/messages", body)[0])
+        self.assertEqual(200, post(self.port, "/v1/messages", text_request())[0])
         record = self.wait_for_log(lambda r: r.get("action") == "relay")[0]
-        self.assertEqual({"side": "in", "status": 200, "path": "/v1/messages",
+        self.assertEqual({"status": 200, "path": "/v1/messages",
                           "bytes": len(stub_upstream.SSE.encode())},
-                         {k: record[k] for k in ("side", "status", "path", "bytes")})
+                         {k: record[k] for k in ("status", "path", "bytes")})
         self.assertIsInstance(record["duration_ms"], int)
         self.assertGreaterEqual(record["duration_ms"], 0)
-        usage = self.wait_for_log(lambda r: r.get("action") == "usage")[0]
-        self.assertIsInstance(usage["duration_ms"], int)
 
     def test_unreachable_upstream_logs_a_transport_record(self):
-        self.start_shim(out_target=f"http://127.0.0.1:{_free_port()}/v1")
-        status, _, _ = post(self.out_port, "/v1/messages", json.dumps({"messages": []}).encode())
+        self.start_shim(target=f"http://127.0.0.1:{_free_port()}/v1")
+        status, _, _ = post(self.port, "/v1/messages", json.dumps({"messages": []}).encode())
         self.assertEqual(502, status)
         record = self.wait_for_log(lambda r: r.get("action") == "transport")[0]
-        self.assertEqual({"side": "out", "phase": "connect", "status": 502, "bytes": 0},
-                         {k: record[k] for k in ("side", "phase", "status", "bytes")})
+        self.assertEqual({"phase": "connect", "status": 502, "bytes": 0},
+                         {k: record[k] for k in ("phase", "status", "bytes")})
         self.assertIn("ConnectionRefusedError", record["error"])
 
     def test_upstream_dying_mid_stream_logs_a_transport_record(self):
@@ -410,10 +311,10 @@ class RelayOutcomes(ShimCase):
         # truncated chunked body: exactly what a CLI then reports as a retry. (http.client
         # raises before handing over the chunk it had buffered, hence 0 bytes relayed.)
         with self.assertRaises(http.client.IncompleteRead):
-            post(self.out_port, "/v1/truncate", b"{}")
+            post(self.port, "/v1/truncate", b"{}")
         record = self.wait_for_log(lambda r: r.get("action") == "transport")[0]
-        self.assertEqual({"side": "out", "phase": "stream", "status": 200, "bytes": 0},
-                         {k: record[k] for k in ("side", "phase", "status", "bytes")})
+        self.assertEqual({"phase": "stream", "status": 200, "bytes": 0},
+                         {k: record[k] for k in ("phase", "status", "bytes")})
         self.assertIn("IncompleteRead", record["error"])
         self.assertIsNone(self.proc.poll())  # still alive
 
@@ -421,15 +322,14 @@ class RelayOutcomes(ShimCase):
         self.start_shim()
         request = (b"POST /v1/slow HTTP/1.1\r\nhost: x\r\ncontent-length: 2\r\n"
                    b"content-type: application/json\r\n\r\n{}")
-        sock = socket.create_connection(("127.0.0.1", self.in_port), timeout=10)
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
         # linger 0: close() sends RST at once, so the shim's next write fails instead of
         # filling a kernel buffer nobody reads (a plain close is not prompt on every OS)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         sock.sendall(request)
         sock.recv(4096)  # the status line and headers, maybe the first chunk
         sock.close()
-        record = self.wait_for_log(lambda r: r.get("action") == "client-gone"
-                                   and r.get("side") == "in")[0]
+        record = self.wait_for_log(lambda r: r.get("action") == "client-gone")[0]
         self.assertEqual({"status": 200, "path": "/v1/slow"},
                          {k: record[k] for k in ("status", "path")})
         self.assertIn("Error", record["error"])
@@ -440,60 +340,66 @@ class Plumbing(ShimCase):
 
     def test_configured_bind_address_is_reported_and_serves_requests(self):
         self.start_shim(bind="0.0.0.0")
-        banner = (self.tmp / "shim.out").read_text()
-        self.assertIn(f"IN 0.0.0.0:{self.in_port}", banner)
-        self.assertIn(f"OUT 0.0.0.0:{self.out_port}", banner)
-
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        status, _, data = post(self.in_port, "/v1/messages", body)
+        self.assertIn(f"0.0.0.0:{self.port} ->", (self.tmp / "shim.out").read_text())
+        status, _, data = post(self.port, "/v1/messages", text_request())
         self.assertEqual(200, status)
         self.assertEqual(stub_upstream.SSE.encode(), data)
 
-    def test_in_to_out_chain_returns_the_body_unchanged(self):
+    def test_target_defaults_to_the_anthropic_api(self):
+        # Nothing leaves the machine here: the banner is printed before the listener starts,
+        # and this test sends no request.
+        self.start_shim(target=UNSET)
+        banner = (self.tmp / "shim.out").read_text()
+        self.assertIn(f"127.0.0.1:{self.port} -> https://api.anthropic.com/v1", banner)
+
+    def test_request_without_changes_passes_byte_for_byte(self):
         self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        status, _, data = post(self.in_port, "/v1/messages", body)
+        body = text_request()
+        status, _, data = post(self.port, "/v1/messages", body)
         self.assertEqual(200, status)
         self.assertEqual(stub_upstream.SSE.encode(), data)
         self.assertEqual("/v1/messages", stub_upstream.LAST["path"])
         self.assertEqual(body, stub_upstream.LAST["body"])
 
+    def test_target_prefix_is_never_doubled(self):
+        # A gateway may drop the leading /v1 on one path and keep it on another.
+        self.start_shim()
+        for path in ("/messages", "/v1/messages/count_tokens"):
+            post(self.port, path, text_request())
+            self.assertEqual("/v1" + path.removeprefix("/v1"), stub_upstream.LAST["path"])
+
+    def test_encoded_reply_is_relayed_as_is(self):
+        self.start_shim()
+        status, headers, data = post(self.port, "/v1/messages/count_tokens", text_request())
+        self.assertEqual(200, status)
+        self.assertEqual("gzip", headers.get("content-encoding"))
+        self.assertEqual({"usage": {"input_tokens": 12345}}, json.loads(gzip.decompress(data)))
+
     def test_no_captures_when_capture_dir_is_unset(self):
         self.start_shim()
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        self.assertEqual(200, post(self.in_port, "/v1/messages", body)[0])
-        self.wait_for_log(lambda r: r.get("action") == "usage")
-        self.assertFalse((self.tmp / "captures").exists())
+        self.assertEqual(200, post(self.port, "/v1/messages", text_request())[0])
+        self.wait_for_log(lambda r: r.get("action") == "relay")
         self.assertEqual([], sorted(p.name for p in self.tmp.iterdir()
                                     if p.name.endswith("-req.json") or p.is_dir()))
 
     def test_captures_written_when_capture_dir_is_set(self):
         captures = self.tmp / "captures"
         self.start_shim(capture_dir=captures)
-        body = json.dumps({"model": "m", "messages": [
-            {"role": "user", "content": [{"type": "text", "text": "hello"}]}]}).encode()
-        self.assertEqual(200, post(self.in_port, "/v1/messages", body)[0])
-        wanted = [captures / "in" / "001-req.json", captures / "in" / "001-req.body",
-                  captures / "out" / "001-req.json", captures / "out" / "001-resp.body"]
+        body = text_request()
+        self.assertEqual(200, post(self.port, "/v1/messages", body)[0])
+        wanted = [captures / f"001-{name}"
+                  for name in ("req.json", "req.body", "resp.json", "resp.body")]
         self.assertTrue(self.wait_for(lambda: all(p.exists() for p in wanted)),
                         f"missing: {[str(p) for p in wanted if not p.exists()]}")
-        self.assertEqual(body, (captures / "out" / "001-req.body").read_bytes())
+        self.assertEqual(body, (captures / "001-req.body").read_bytes())
 
     def test_log_mode_records_but_does_not_rewrite(self):
         self.start_shim(mode="log")
-        content = [
-            {"type": "tool_reference", "tool_name": "Widget"},
-            {"type": "text", "text": ANNOTATION},
-        ]
-        body = tool_result_request("toolu_logmode", content)
-        status, _, _ = post(self.out_port, "/v1/messages", body)
+        body = tool_result_request("toolu_logmode", [REFERENCE, annotation(7)])
+        status, _, _ = post(self.port, "/v1/messages", body)
         self.assertEqual(200, status)
         self.assertEqual(body, stub_upstream.LAST["body"])
-        self.assertEqual(content, sent_tool_result_content(stub_upstream.LAST["body"]))
-        record = self.wait_for_log(lambda r: r.get("action") == "strip")[0]
+        record = self.records("strip")[0]
         self.assertEqual("log", record["mode"])
         self.assertEqual("toolu_logmode", record["tool_use_id"])
 
