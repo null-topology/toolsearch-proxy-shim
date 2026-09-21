@@ -1,7 +1,7 @@
 [project]
 name = "toolsearch-proxy-shim"
-version = "0.2.0"
-description = "Keeps Claude Code's tool search working through a request-rewriting proxy, with per-request accounting"
+version = "0.3.0"
+description = "Keeps Claude Code's tool search working through a gateway that annotates requests"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
